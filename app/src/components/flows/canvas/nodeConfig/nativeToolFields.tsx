@@ -1,0 +1,117 @@
+/**
+ * NativeToolField — the tool picker for the "Tool" node (native OpenHuman tools,
+ * as opposed to the Composio "App action" node). Loads the native tool registry
+ * from `agentRegistryApi.availableTools` (`openhuman.agent_registry_available_tools`)
+ * and lets the author pick one from a dropdown; the value stored on `config.slug`
+ * is `oh:<tool_name>`, which the flow engine routes to the same native tool
+ * registry (`tools::native_ops`).
+ *
+ * Shows the selected tool's description so the author knows what it does.
+ * Fetches are guarded — outside Tauri, on error, or when the registry returns
+ * no usable tools it falls back to a raw text input so a slug is never a dead
+ * end.
+ */
+import { useEffect, useMemo, useState } from 'react';
+
+import { cn } from '../../../../lib/cn';
+import { useT } from '../../../../lib/i18n/I18nContext';
+import { agentRegistryApi, type AgentToolInfo } from '../../../../services/api/agentRegistryApi';
+import { NativeSelect, Input as UiInput } from '../../../ui';
+import { Field, MONO_CLASS } from './nodeConfigFields';
+
+/** The `oh:` prefix that marks a native-tool slug (mirrors the Rust constant). */
+export const NATIVE_TOOL_PREFIX = 'oh:';
+
+interface NativeToolFieldProps {
+  label: string;
+  hint?: string;
+  /** The full `config.slug`, e.g. `oh:web_search` (or empty / `oh:`). */
+  value: string;
+  onChange: (value: string) => void;
+  testId?: string;
+}
+
+/** Strip the `oh:` prefix to the bare tool name. */
+function toolName(slug: string): string {
+  return slug.startsWith(NATIVE_TOOL_PREFIX) ? slug.slice(NATIVE_TOOL_PREFIX.length) : slug;
+}
+
+export function NativeToolField({ label, hint, value, onChange, testId }: NativeToolFieldProps) {
+  const { t } = useT();
+  const [tools, setTools] = useState<AgentToolInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await agentRegistryApi.availableTools();
+        if (!cancelled) setTools(list);
+      } catch {
+        // Leave `tools` empty; the raw-input fallback below takes over.
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const current = toolName(value);
+  const selected = useMemo(() => tools.find(tool => tool.name === current), [tools, current]);
+
+  // Catalog unavailable or empty (fetch failed, or returned no usable tools) →
+  // raw text input so the author can still enter a slug.
+  if (!loading && tools.length === 0) {
+    return (
+      <Field label={label} hint={hint}>
+        <UiInput
+          type="text"
+          inputSize="sm"
+          className={cn('w-full', MONO_CLASS)}
+          value={current}
+          placeholder="web_search"
+          data-testid={testId ? `${testId}-custom` : undefined}
+          onChange={e =>
+            onChange(e.target.value ? `${NATIVE_TOOL_PREFIX}${e.target.value.trim()}` : '')
+          }
+        />
+      </Field>
+    );
+  }
+
+  // Keep a saved-but-unknown tool selectable.
+  const names = current && !tools.some(tk => tk.name === current) ? [current] : [];
+  const options = [...names, ...tools.map(tk => tk.name)];
+
+  return (
+    <Field label={label} hint={hint}>
+      <div className="space-y-1.5">
+        <NativeSelect
+          inputSize="sm"
+          className="w-full"
+          value={current}
+          disabled={loading}
+          data-testid={testId}
+          onChange={e => onChange(e.target.value ? `${NATIVE_TOOL_PREFIX}${e.target.value}` : '')}>
+          <option value="">
+            {loading ? t('flows.nodeConfig.native.loading') : t('flows.nodeConfig.native.select')}
+          </option>
+          {options.map(name => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </NativeSelect>
+        {selected?.description && (
+          <p
+            className="text-[11px] leading-snug text-content-muted"
+            data-testid="node-config-native-desc">
+            {selected.description}
+          </p>
+        )}
+      </div>
+    </Field>
+  );
+}

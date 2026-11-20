@@ -1,0 +1,87 @@
+use super::*;
+
+#[test]
+fn sandbox_exec_result_success_checks() {
+    let ok = SandboxExecResult {
+        exit_code: 0,
+        stdout: "hello".into(),
+        stderr: String::new(),
+        timed_out: false,
+    };
+    assert!(ok.success());
+
+    let failed = SandboxExecResult {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: "error".into(),
+        timed_out: false,
+    };
+    assert!(!failed.success());
+
+    let timeout = SandboxExecResult {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+        timed_out: true,
+    };
+    assert!(!timeout.success());
+}
+
+#[test]
+fn sandbox_backend_kind_default_is_none() {
+    assert_eq!(SandboxBackendKind::default(), SandboxBackendKind::None);
+}
+
+#[test]
+fn sandbox_policy_serializes_roundtrip() {
+    let policy = SandboxPolicy {
+        filesystem_only: false,
+        backend: SandboxBackendKind::Docker,
+        workspace_root: PathBuf::from("/workspace"),
+        state_dir: PathBuf::from("/tmp/state"),
+        read_only_mounts: vec![PathBuf::from("/usr/lib")],
+        read_write_mounts: vec![],
+        allow_network: false,
+        mount_workspace: true,
+        env_passthrough: vec!["PATH".into()],
+        docker_overrides: Some(DockerOverrides {
+            image: Some("node:20-slim".into()),
+            memory_limit_mb: Some(256),
+            ..DockerOverrides::default()
+        }),
+    };
+    let json = serde_json::to_string(&policy).unwrap();
+    let back: SandboxPolicy = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.backend, SandboxBackendKind::Docker);
+    assert!(!back.allow_network);
+}
+
+#[test]
+fn sandbox_status_variants() {
+    assert_ne!(SandboxStatus::Inactive, SandboxStatus::Ready);
+    assert_ne!(SandboxStatus::Ready, SandboxStatus::Busy);
+    assert_ne!(SandboxStatus::Busy, SandboxStatus::Error);
+}
+
+#[test]
+fn the_openshell_kind_is_named_openshell_on_the_wire() {
+    assert_eq!(
+        serde_json::to_value(SandboxBackendKind::OpenShell).unwrap(),
+        serde_json::json!("openshell")
+    );
+    let back: SandboxBackendKind = serde_json::from_value(serde_json::json!("openshell")).unwrap();
+    assert_eq!(back, SandboxBackendKind::OpenShell);
+}
+
+#[test]
+fn the_openshell_and_agent37_backends_keep_a_box_between_commands() {
+    assert!(SandboxBackendKind::OpenShell.keeps_boxes());
+    assert!(SandboxBackendKind::Agent37.keeps_boxes());
+    for backend in [
+        SandboxBackendKind::None,
+        SandboxBackendKind::Local,
+        SandboxBackendKind::Docker,
+    ] {
+        assert!(!backend.keeps_boxes(), "{backend:?}");
+    }
+}

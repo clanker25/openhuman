@@ -1,0 +1,199 @@
+//! Browser config types.
+
+use super::super::defaults;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct BrowserConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// DEPRECATED: the browser tool now shares the unified web-access host list
+    /// in `[http_request].allowed_domains` (see `tools::ops::all_tools_with_runtime`).
+    /// Still parsed for backward compatibility but no longer gates browser
+    /// navigation. Manage allowed hosts via Settings → Search → Allowed websites;
+    /// browser allow-all remains gated by `OPENHUMAN_BROWSER_ALLOW_ALL`.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default = "default_browser_backend")]
+    pub backend: String,
+    /// Run Chrome without a visible window.
+    #[serde(default = "default_true")]
+    pub headless: bool,
+    #[serde(default = "default_viewport_width")]
+    pub viewport_width: u32,
+    #[serde(default = "default_viewport_height")]
+    pub viewport_height: u32,
+    #[serde(default)]
+    pub chrome_path: Option<String>,
+    /// `fresh` creates an isolated disposable Chrome profile; `persistent` uses `profile_path`.
+    #[serde(default = "default_profile_mode")]
+    pub profile_mode: String,
+    #[serde(default)]
+    pub profile_path: Option<String>,
+    #[serde(default)]
+    pub download_dir: Option<String>,
+    #[serde(default = "default_max_task_steps")]
+    pub max_task_steps: usize,
+    #[serde(default = "default_task_timeout_secs")]
+    pub task_timeout_secs: u64,
+    /// Gated browser action kinds a trusted unattended turn (a cron job, a
+    /// background job, or a workflow without `require_approval`) may take
+    /// without the interactive host approval it cannot get. Empty, the
+    /// default, keeps every such action behind the approval gate. Known names
+    /// are [`UNATTENDED_BROWSER_ACTIONS`]; any other entry is ignored with a
+    /// warning. Chat, channel and unlabelled turns are never affected.
+    #[serde(default)]
+    pub unattended_actions: Vec<String>,
+    /// Keep, per site, the plan a finished browser task ran and the elements
+    /// it found, and hand them to the next task there
+    /// (`modules::site_memory_host`). Kept in the workspace only, never in the
+    /// agent's memory.
+    #[serde(default = "default_true")]
+    pub learn_from_tasks: bool,
+    /// An executable that answers one site's password, for the browser's
+    /// `{{keychain:<site>}}` placeholder (`tools::impl::browser::keychain`).
+    /// An absolute path, run as `<command> <page host>` with no shell; the
+    /// password is its standard output. Unset, the default, leaves the
+    /// placeholder off: a fill or type that carries one is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain_command: Option<String>,
+    /// Destination domains the browser reaches through an upstream HTTP
+    /// proxy, for sites that refuse this machine's own address (a datacenter
+    /// range, say). Each entry's `domains` match themselves and every
+    /// subdomain. TinySecurity still authorizes every such destination, and
+    /// the proxy's own host and port as well; TinyComputer then tunnels with
+    /// `CONNECT` (`browser.egress.upstream_proxies` in its module config).
+    /// Applies only with browser egress enforcement (`security-module`).
+    /// Empty, the default, routes nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_proxies: Vec<BrowserUpstreamProxy>,
+}
+
+/// One `[browser] upstream_proxies` entry. `url` is an
+/// `http://user:password@host:port` proxy URL with percent-encoded
+/// credentials; it is never logged, and `Debug` leaves it out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BrowserUpstreamProxy {
+    /// Destination domains routed through this proxy, such as `reddit.com`.
+    pub domains: Vec<String>,
+    /// The proxy URL. Only `http://` proxies are supported.
+    pub url: String,
+}
+
+impl std::fmt::Debug for BrowserUpstreamProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserUpstreamProxy")
+            .field("domains", &self.domains)
+            .field("url", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Action kinds `[browser] unattended_actions` may name: the gated direct
+/// actions, by their TinyComputer wire names, plus `task_step` for a browser
+/// task paused at `needs_approval`.
+pub const UNATTENDED_BROWSER_ACTIONS: &[&str] = &[
+    "click",
+    "double_click",
+    "fill",
+    "type",
+    "press",
+    "select",
+    "check",
+    "task_step",
+];
+
+fn normalized_action(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+impl BrowserConfig {
+    /// Whether `kind` is a known gated action listed in `unattended_actions`.
+    /// Says nothing about the turn; callers check its origin separately.
+    pub fn allows_unattended(&self, kind: &str) -> bool {
+        self.unattended_kind(kind).is_some()
+    }
+
+    /// The canonical, static name of `kind` when it is a known gated action
+    /// listed in `unattended_actions`. Both sides are trimmed and lowercased.
+    /// Being static, it is safe to log whatever the caller passed in.
+    pub fn unattended_kind(&self, kind: &str) -> Option<&'static str> {
+        let kind = normalized_action(kind);
+        let canonical = UNATTENDED_BROWSER_ACTIONS
+            .iter()
+            .copied()
+            .find(|known| *known == kind)?;
+        self.unattended_actions
+            .iter()
+            .any(|listed| normalized_action(listed) == canonical)
+            .then_some(canonical)
+    }
+
+    /// Entries of `unattended_actions` that name no known action kind. They
+    /// allow nothing; the loader reports them so a typo is not silent.
+    pub fn unknown_unattended_actions(&self) -> Vec<String> {
+        self.unattended_actions
+            .iter()
+            .filter(|listed| {
+                !UNATTENDED_BROWSER_ACTIONS.contains(&normalized_action(listed).as_str())
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn default_viewport_width() -> u32 {
+    1280
+}
+fn default_viewport_height() -> u32 {
+    800
+}
+fn default_profile_mode() -> String {
+    "fresh".into()
+}
+fn default_max_task_steps() -> usize {
+    20
+}
+fn default_task_timeout_secs() -> u64 {
+    120
+}
+
+fn default_true() -> bool {
+    defaults::default_true()
+}
+
+fn default_browser_backend() -> String {
+    "tinycomputer".into()
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: Vec::new(),
+            session_name: None,
+            backend: default_browser_backend(),
+            headless: true,
+            viewport_width: default_viewport_width(),
+            viewport_height: default_viewport_height(),
+            chrome_path: None,
+            profile_mode: default_profile_mode(),
+            profile_path: None,
+            download_dir: None,
+            max_task_steps: default_max_task_steps(),
+            task_timeout_secs: default_task_timeout_secs(),
+            unattended_actions: Vec::new(),
+            learn_from_tasks: true,
+            keychain_command: None,
+            upstream_proxies: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "browser_tests.rs"]
+mod tests;

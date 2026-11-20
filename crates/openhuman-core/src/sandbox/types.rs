@@ -1,0 +1,158 @@
+//! Sandbox domain types.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Which sandbox backend to use for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackendKind {
+    /// No sandbox — commands execute directly on the host.
+    #[default]
+    None,
+    /// Module-owned native process jail selected by TinyBox.
+    Local,
+    /// Docker container isolation.
+    Docker,
+    /// The tenant's long-lived OpenShell box (`sandbox::boxes`).
+    #[serde(rename = "openshell")]
+    OpenShell,
+    /// The tenant's retained box on the hosted agent37 service
+    /// (`sandbox::agent37`, over `sandbox::boxes`).
+    #[serde(rename = "agent37")]
+    Agent37,
+}
+
+impl SandboxBackendKind {
+    /// Whether the backend keeps a box per tenant between commands, so a file
+    /// an agent makes stays in that tenant's box and is not on the host.
+    /// [`Self::OpenShell`] and [`Self::Agent37`] do; a backend that joins
+    /// them answers `true` here and gets the box-side behavior of every
+    /// caller that asks.
+    pub fn keeps_boxes(self) -> bool {
+        matches!(self, Self::OpenShell | Self::Agent37)
+    }
+}
+
+/// Per-session sandbox policy resolved from agent definition, session
+/// origin, and global config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxPolicy {
+    /// Which backend to use.
+    pub backend: SandboxBackendKind,
+    /// Workspace root mounted into the sandbox (read/write).
+    pub workspace_root: PathBuf,
+    /// The core's own state directory (`workspace_dir`), never the user's
+    /// project. Per-call scratch the sandbox needs on the host, such as the
+    /// local jail's output capture, lives under it so nothing appears in
+    /// `workspace_root` while a command runs.
+    pub state_dir: PathBuf,
+    /// Additional read-only mounts (e.g. `/usr/lib`).
+    pub read_only_mounts: Vec<PathBuf>,
+    /// Additional read-write mounts (e.g. `~/.cargo`). Local jail only.
+    #[serde(default)]
+    pub read_write_mounts: Vec<PathBuf>,
+    /// Whether outbound network is allowed inside the sandbox.
+    pub allow_network: bool,
+    /// Whether the configured executor mounts the workspace into its namespace.
+    #[serde(default = "default_mount_workspace")]
+    pub mount_workspace: bool,
+    /// Environment variables to passthrough into the sandbox.
+    pub env_passthrough: Vec<String>,
+    /// Docker-specific overrides (image, resource limits).
+    pub docker_overrides: Option<DockerOverrides>,
+    /// The agent opted into a files-only jail (`AgentExt::sandbox_filesystem_only`):
+    /// with the host network, its plan asks the executor to enforce only the file
+    /// grants (`spawn_plan::files_only`). Never set for text the host did not author.
+    #[serde(default)]
+    pub filesystem_only: bool,
+}
+
+fn default_mount_workspace() -> bool {
+    true
+}
+
+/// Docker-specific sandbox overrides layered on top of the global
+/// `DockerRuntimeConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DockerOverrides {
+    pub image: Option<String>,
+    pub network: Option<String>,
+    pub memory_limit_mb: Option<u64>,
+    pub cpu_limit: Option<f64>,
+    pub read_only_rootfs: Option<bool>,
+    pub extra_caps_drop: Vec<String>,
+}
+
+/// A request to execute a command inside a sandbox.
+#[derive(Debug, Clone)]
+pub struct SandboxExecRequest {
+    /// Shell command string to execute.
+    pub command: String,
+    /// Working directory inside the sandbox. For Docker this is the
+    /// container-side path (e.g. `/workspace`).
+    pub working_dir: PathBuf,
+    /// Environment variables to inject.
+    pub env: HashMap<std::ffi::OsString, std::ffi::OsString>,
+    /// Execution timeout.
+    pub timeout: std::time::Duration,
+}
+
+/// Result of a sandboxed command execution.
+#[derive(Debug, Clone)]
+pub struct SandboxExecResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// Whether the command was killed due to timeout.
+    pub timed_out: bool,
+}
+
+impl SandboxExecResult {
+    pub fn success(&self) -> bool {
+        self.exit_code == 0 && !self.timed_out
+    }
+}
+
+/// Handle to an active sandbox backend. Callers use this to execute
+/// commands and query status without knowing the backend implementation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxBackendHandle {
+    pub kind: SandboxBackendKind,
+    pub status: SandboxStatus,
+    /// Container ID for Docker backends; jail label for local.
+    pub backend_id: Option<String>,
+    /// How strongly a ready local jail confines commands; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<SandboxIsolation>,
+}
+
+/// The confinement a local native jail actually provides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxIsolation {
+    /// Kernel (or stronger) process isolation: fit for untrusted code.
+    Isolated,
+    /// Writes confined to the selected folder (macOS Seatbelt); no process
+    /// isolation.
+    FolderConfined,
+}
+
+/// Health/lifecycle status of a sandbox backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxStatus {
+    /// Backend not initialized.
+    Inactive,
+    /// Backend ready to accept commands.
+    Ready,
+    /// Backend is executing a command.
+    Busy,
+    /// Backend encountered an error and needs restart/cleanup.
+    Error,
+}
+
+#[cfg(test)]
+#[path = "types_tests.rs"]
+mod tests;

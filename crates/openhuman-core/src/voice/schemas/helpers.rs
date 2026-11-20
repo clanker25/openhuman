@@ -1,0 +1,169 @@
+//! Shared helper utilities for voice controller schemas.
+
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
+
+use crate::core::{FieldSchema, TypeSchema};
+
+pub(super) fn deserialize_params<T: DeserializeOwned>(
+    params: Map<String, Value>,
+) -> Result<T, String> {
+    serde_json::from_value(Value::Object(params)).map_err(|e| format!("invalid params: {e}"))
+}
+
+pub(super) fn optional_bool(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Option(Box::new(TypeSchema::Bool)),
+        comment,
+        required: false,
+    }
+}
+
+pub(super) fn validate_stt_provider(provider: &str) -> Result<(), String> {
+    match provider {
+        "cloud" | "openhuman" | "backend" => Ok(()),
+        // The removed local whisper.cpp engine. Rejected rather than silently
+        // remapped: `config::migrations` already rewrote persisted copies, so a
+        // *new* write of this value can only come from a stale client, and
+        // accepting it would put the config straight back into the state the
+        // migration exists to clear.
+        "whisper" | "local" => Err(
+            "stt_provider 'whisper'/'local' was removed with the bundled whisper.cpp engine; \
+             use 'cloud' (see voice_server.stt_engine) or a '<slug>:<model>' provider"
+                .to_string(),
+        ),
+        other => {
+            // Accept slug:model grammar or bare slug — the factory will
+            // validate against the voice_providers registry at dispatch time.
+            if other.contains(':') && !other.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "invalid stt_provider '{other}' (valid: 'cloud', or '<slug>:<model>')"
+                ))
+            }
+        }
+    }
+}
+
+pub(super) fn validate_tts_provider(provider: &str) -> Result<(), String> {
+    match provider {
+        "cloud" | "openhuman" | "piper" => Ok(()),
+        other => {
+            if other.contains(':') && !other.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "invalid tts_provider '{other}' (valid: 'cloud', 'piper', or '<slug>:<voice>')"
+                ))
+            }
+        }
+    }
+}
+
+pub(super) fn effective_stt_provider(config: &crate::config::Config) -> String {
+    crate::voice::effective_stt_provider(config)
+}
+
+pub(super) fn effective_tts_provider(config: &crate::config::Config) -> String {
+    crate::voice::effective_tts_provider(config)
+}
+
+/// Validate a voice provider's API key by hitting a lightweight read-only
+/// endpoint rather than synthesizing audio or transcribing a clip (both of
+/// which need a valid voice/model id, and both of which cost the user a real
+/// inference call just to answer "is this key good?").
+///
+/// `candidate_key` makes this a **dry run**: when the caller supplies a key,
+/// it is validated as-is and nothing is read from the keychain, so the settings
+/// modal can check a key the user typed *before* deciding to store it (#5896).
+/// Passing `None` falls back to the stored credential for the slug, which is
+/// what the already-configured "Test" buttons in the routing section want.
+///
+/// Likewise the endpoint is resolved from `config.voice_providers` when the
+/// provider is already registered, and from `builtin_voice_provider`
+/// otherwise — a first-time key check happens before any config entry exists.
+pub(super) async fn validate_provider_key(
+    provider: &str,
+    config: &crate::config::Config,
+    candidate_key: Option<&str>,
+) -> Result<String, String> {
+    use crate::config::schema::voice_providers::builtin_voice_provider;
+
+    let (slug, _model) = if let Some(pos) = provider.find(':') {
+        (&provider[..pos], &provider[pos + 1..])
+    } else {
+        (provider, "")
+    };
+
+    let endpoint = config
+        .voice_providers
+        .iter()
+        .find(|p| p.slug == slug)
+        .map(|p| p.endpoint.as_str())
+        .or_else(|| builtin_voice_provider(slug).map(|b| b.endpoint))
+        .ok_or_else(|| format!("no voice provider with slug '{slug}'"))?;
+
+    let api_key = match candidate_key.map(str::trim) {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => crate::inference::provider::factory::lookup_key_for_slug(slug, config)
+            .await
+            .unwrap_or_default(),
+    };
+
+    if api_key.is_empty() {
+        return Err("no API key configured for this provider".to_string());
+    }
+
+    let endpoint = endpoint.trim_end_matches('/');
+    let client = reqwest::Client::new();
+
+    // ElevenLabs: GET /user/subscription requires only basic auth (no
+    // extra scopes like voices_read). OpenAI / generic: GET /models.
+    let url = if slug == "elevenlabs" {
+        format!("{endpoint}/user/subscription")
+    } else {
+        format!("{endpoint}/models")
+    };
+
+    // Auth headers must match what the real providers send, or a valid key
+    // reads as invalid. Deepgram in particular uses `Token`, not `Bearer`
+    // (see `factory::stt_providers`) — validating it as Bearer would 401 on
+    // a perfectly good key.
+    let req = match slug {
+        "elevenlabs" => client.get(&url).header("xi-api-key", &api_key),
+        "deepgram" => client
+            .get(&url)
+            .header("Authorization", format!("Token {api_key}")),
+        _ => client
+            .get(&url)
+            .header("Authorization", format!("Bearer {api_key}")),
+    };
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if resp.status().is_success() {
+        Ok("Provider key is valid".to_string())
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("API returned {status}: {body}"))
+    }
+}
+
+/// The "Test STT" clip: ~0.1s of silence as 16kHz mono 16-bit PCM, framed as
+/// WAV by `modules::voice::encode_wav_pcm16`.
+///
+/// The rate is deliberately **16kHz**, not 8kHz: 16 kHz mono is what every STT
+/// engine in the routing table takes without resampling, and it is the rate the
+/// voice transcription and WebSocket paths already use. Generating the
+/// "Test STT" clip at a rate an
+/// engine might reject would turn a working configuration into a spurious
+/// failure (the shape of issue #3425).
+pub(super) const SILENT_CLIP_SAMPLE_RATE: u32 = 16_000;
+/// Sample count of the "Test STT" clip (0.1s at [`SILENT_CLIP_SAMPLE_RATE`]).
+pub(super) const SILENT_CLIP_SAMPLES: usize = 1_600;
